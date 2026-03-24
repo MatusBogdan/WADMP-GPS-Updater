@@ -14,6 +14,9 @@ The script validates input, handles common network and API failures, and writes 
 |-- config.env.example
 |-- requirements.txt
 |-- README.md
+|-- deploy/
+|   |-- wadmp-gps-updater.service
+|   |-- wadmp-gps-updater.timer
 ```
 
 ## Prerequisites
@@ -86,6 +89,8 @@ RUN_INTERVAL_HOURS="2"
 
 The process will keep running until it is stopped with `Ctrl+C`.
 
+For Linux production deployment, prefer the `systemd` service and timer described below and keep `RUN_INTERVAL_HOURS="0"`.
+
 Verbose mode:
 
 ```powershell
@@ -107,6 +112,97 @@ Batch read:
 Batch CSV write:
 
 - `POST /management/devices/long-operations/fields/csv`
+
+## Linux Service Setup
+
+For Linux, the recommended approach is:
+
+- keep `RUN_INTERVAL_HOURS="0"` in `config.env`
+- run one batch per execution
+- let `systemd` trigger the script on schedule
+
+This is more reliable than keeping one long-running terminal process alive.
+
+### 1. Prepare the application directory
+
+Example target directory:
+
+```bash
+sudo mkdir -p /opt/wadmp-gps-updater
+sudo cp wadmp_gps_updater.py requirements.txt config.env /opt/wadmp-gps-updater/
+sudo cp -r deploy /opt/wadmp-gps-updater/
+cd /opt/wadmp-gps-updater
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+mkdir -p output
+```
+
+### 2. Create a dedicated service user
+
+```bash
+sudo useradd --system --home /opt/wadmp-gps-updater --shell /usr/sbin/nologin wadmpgps
+sudo chown -R wadmpgps:wadmpgps /opt/wadmp-gps-updater
+```
+
+### 3. Install the `systemd` unit files
+
+The repository contains ready-made files:
+
+- `deploy/wadmp-gps-updater.service`
+- `deploy/wadmp-gps-updater.timer`
+
+Copy them to `systemd`:
+
+```bash
+sudo cp /opt/wadmp-gps-updater/deploy/wadmp-gps-updater.service /etc/systemd/system/
+sudo cp /opt/wadmp-gps-updater/deploy/wadmp-gps-updater.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+### 4. Adjust the timer interval if needed
+
+Default timer interval is every 2 hours:
+
+```ini
+OnUnitActiveSec=2h
+```
+
+If you want a different Linux service schedule, edit:
+
+- `/etc/systemd/system/wadmp-gps-updater.timer`
+
+Then reload:
+
+```bash
+sudo systemctl daemon-reload
+```
+
+### 5. Enable and start the timer
+
+```bash
+sudo systemctl enable --now wadmp-gps-updater.timer
+```
+
+### 6. Check status and logs
+
+```bash
+sudo systemctl status wadmp-gps-updater.timer
+sudo systemctl status wadmp-gps-updater.service
+journalctl -u wadmp-gps-updater.service -n 100 --no-pager
+```
+
+### 7. Run one manual test
+
+```bash
+sudo systemctl start wadmp-gps-updater.service
+sudo systemctl status wadmp-gps-updater.service
+```
+
+### Notes
+
+- The Linux `systemd` timer is the preferred production mode.
+- The internal `RUN_INTERVAL_HOURS` loop is still available, but it is better suited for manual terminal runs.
+- If you change the application path, user, or virtualenv path, update the service file accordingly.
 
 ## Console Flow
 

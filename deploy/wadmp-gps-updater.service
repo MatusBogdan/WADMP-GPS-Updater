@@ -1,0 +1,11 @@
+[Unit]
+Description=WADMP GPS Updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=wadmpgps
+WorkingDirectory=/opt/wadmp-gps-updater
+ExecStart=/opt/wadmp-gps-updater/.venv/bin/python /opt/wadmp-gps-updater/wadmp_gps_updater.py --config /opt/wadmp-gps-updater/config.env
+

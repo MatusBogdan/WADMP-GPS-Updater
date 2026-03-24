@@ -1,0 +1,11 @@
+[Unit]
+Description=Run WADMP GPS Updater every 2 hours
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=2h
+Persistent=true
+Unit=wadmp-gps-updater.service
+
+[Install]
+WantedBy=timers.target
