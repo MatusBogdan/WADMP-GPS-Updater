@@ -27,6 +27,7 @@ DEFAULT_UPDATE_CSV_PATH = "/management/devices/long-operations/fields/csv"
 DEFAULT_LONG_OPERATION_PATH = "/long-operations/{operation_id}"
 DEFAULT_ONLINE_FIELD = "Online"
 DEFAULT_ONLINE_VALUE = "1"
+DEFAULT_RUN_INTERVAL_HOURS = 0
 DEFAULT_LONG_OPERATION_POLL_SECONDS = 2
 DEFAULT_LONG_OPERATION_TIMEOUT_SECONDS = 120
 MAC_PATTERN = re.compile(r"^[0-9A-Fa-f]{12}$")
@@ -58,9 +59,12 @@ class Config:
     company_id: int
     online_field: str = DEFAULT_ONLINE_FIELD
     online_value: str = DEFAULT_ONLINE_VALUE
+    run_interval_hours: int = DEFAULT_RUN_INTERVAL_HOURS
     batch_page_size: int = DEFAULT_BATCH_PAGE_SIZE
     mnc_length: int | None = None
     cache_path: Path = DEFAULT_CACHE_PATH
+    output_retention_days: int = 14
+    log_retention_days: int = 14
     monitoring_company_path: str = DEFAULT_MONITORING_COMPANY_PATH
     update_csv_path: str = DEFAULT_UPDATE_CSV_PATH
     long_operation_path: str = DEFAULT_LONG_OPERATION_PATH
@@ -189,6 +193,24 @@ def load_config(config_path: Path) -> Config:
         raw.get("DMP_BATCH_PAGE_SIZE", str(DEFAULT_BATCH_PAGE_SIZE)),
         "DMP_BATCH_PAGE_SIZE",
     )
+    run_interval_hours = parse_non_negative_int(
+        raw.get("RUN_INTERVAL_HOURS", str(DEFAULT_RUN_INTERVAL_HOURS)),
+        "RUN_INTERVAL_HOURS",
+    )
+    if run_interval_hours > 720:
+        raise AppError("Configuration value 'RUN_INTERVAL_HOURS' must be between 0 and 720.")
+    output_retention_days = parse_positive_int(
+        raw.get("OUTPUT_RETENTION_DAYS", "14"),
+        "OUTPUT_RETENTION_DAYS",
+    )
+    if output_retention_days > 90:
+        raise AppError("Configuration value 'OUTPUT_RETENTION_DAYS' must be between 1 and 90.")
+    log_retention_days = parse_positive_int(
+        raw.get("LOG_RETENTION_DAYS", "14"),
+        "LOG_RETENTION_DAYS",
+    )
+    if log_retention_days > 90:
+        raise AppError("Configuration value 'LOG_RETENTION_DAYS' must be between 1 and 90.")
     long_operation_poll_seconds = parse_positive_int(
         raw.get("DMP_LONG_OPERATION_POLL_SECONDS", str(DEFAULT_LONG_OPERATION_POLL_SECONDS)),
         "DMP_LONG_OPERATION_POLL_SECONDS",
@@ -216,9 +238,12 @@ def load_config(config_path: Path) -> Config:
         company_id=parse_positive_int(read_text_key("DMP_COMPANY_ID"), "DMP_COMPANY_ID"),
         online_field=raw.get("DMP_ONLINE_FIELD", DEFAULT_ONLINE_FIELD).strip() or DEFAULT_ONLINE_FIELD,
         online_value=raw.get("DMP_ONLINE_VALUE", DEFAULT_ONLINE_VALUE).strip() or DEFAULT_ONLINE_VALUE,
+        run_interval_hours=run_interval_hours,
         batch_page_size=batch_page_size,
         mnc_length=mnc_length,
         cache_path=Path(raw.get("OPENCELL_CACHE_PATH", str(DEFAULT_CACHE_PATH)).strip() or str(DEFAULT_CACHE_PATH)),
+        output_retention_days=output_retention_days,
+        log_retention_days=log_retention_days,
         long_operation_path=raw.get("DMP_LONG_OPERATION_PATH", DEFAULT_LONG_OPERATION_PATH).strip() or DEFAULT_LONG_OPERATION_PATH,
         long_operation_poll_seconds=long_operation_poll_seconds,
         long_operation_timeout_seconds=long_operation_timeout_seconds,
@@ -256,6 +281,16 @@ def parse_positive_int(raw_value: str, key_name: str) -> int:
         raise AppError(f"Configuration value '{key_name}' must be an integer.") from exc
     if value <= 0:
         raise AppError(f"Configuration value '{key_name}' must be a positive integer.")
+    return value
+
+
+def parse_non_negative_int(raw_value: str, key_name: str) -> int:
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise AppError(f"Configuration value '{key_name}' must be an integer.") from exc
+    if value < 0:
+        raise AppError(f"Configuration value '{key_name}' must be zero or a positive integer.")
     return value
 
 
@@ -722,6 +757,38 @@ def save_csv_payload(csv_bytes: bytes, logger: logging.Logger) -> Path:
     return output_path
 
 
+def cleanup_old_output_files(retention_days: int, logger: logging.Logger) -> None:
+    DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    cutoff_timestamp = time.time() - (retention_days * 24 * 60 * 60)
+    deleted_count = 0
+
+    for file_path in DEFAULT_OUTPUT_DIR.glob("*.csv"):
+        try:
+            if file_path.stat().st_mtime < cutoff_timestamp:
+                file_path.unlink()
+                deleted_count += 1
+                logger.info("Deleted old output CSV file. path=%s", file_path)
+        except OSError as exc:
+            logger.warning("Failed to delete old output CSV file. path=%s error=%s", file_path, exc)
+
+    logger.info(
+        "Output cleanup completed. retention_days=%s deleted_files=%s",
+        retention_days,
+        deleted_count,
+    )
+
+
+def cleanup_old_log_file(retention_days: int) -> str | None:
+    cutoff_timestamp = time.time() - (retention_days * 24 * 60 * 60)
+    try:
+        if DEFAULT_LOG_PATH.exists() and DEFAULT_LOG_PATH.stat().st_mtime < cutoff_timestamp:
+            DEFAULT_LOG_PATH.unlink()
+            return f"Deleted old log file: {DEFAULT_LOG_PATH}"
+    except OSError as exc:
+        return f"Failed to delete old log file {DEFAULT_LOG_PATH}: {exc}"
+    return None
+
+
 def wait_for_long_operation(
     session: Session,
     config: Config,
@@ -957,6 +1024,32 @@ def run_batch_mode(
     return stats
 
 
+def execute_batch_cycle(
+    session: Session,
+    config: Config,
+    logger: logging.Logger,
+) -> BatchStats:
+    print_status("Authenticating to WADMP...")
+    access_token = authenticate_wadmp(session, config, logger)
+    return run_batch_mode(session, config, access_token, logger)
+
+
+def wait_for_next_run(run_interval_hours: int, logger: logging.Logger, reason: str) -> None:
+    next_run_timestamp = time.time() + (run_interval_hours * 3600)
+    next_run_text = datetime.fromtimestamp(next_run_timestamp).strftime("%Y-%m-%d %H:%M:%S")
+    logger.info(
+        "Scheduled next batch run. reason=%s run_interval_hours=%s next_run=%s",
+        reason,
+        run_interval_hours,
+        next_run_text,
+    )
+    print_status(
+        f"Next resync will run in {run_interval_hours} hour(s) at {next_run_text}. "
+        "Press Ctrl+C to stop."
+    )
+    time.sleep(run_interval_hours * 3600)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Update WADMP GPS fields for all online routers using LTE cell data and OpenCell lookup."
@@ -977,40 +1070,58 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def run() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
-    logger = setup_logging(verbose=args.verbose)
 
     try:
         config = load_config(Path(args.config))
+        log_cleanup_message = cleanup_old_log_file(config.log_retention_days)
+        logger = setup_logging(verbose=args.verbose)
+        if log_cleanup_message:
+            logger.info("%s", log_cleanup_message)
+        cleanup_old_output_files(config.output_retention_days, logger)
 
         with requests.Session() as session:
-            print_status("Authenticating to WADMP...")
-            access_token = authenticate_wadmp(session, config, logger)
-            stats = run_batch_mode(session, config, access_token, logger)
+            while True:
+                try:
+                    stats = execute_batch_cycle(session, config, logger)
 
-        print_status("Batch update completed successfully.")
-        if args.verbose:
-            print_status(
-                "Summary: "
-                f"online={stats.total_online}, "
-                f"processed={stats.processed}, "
-                f"prepared={stats.ready_for_upload}, "
-                f"unique_cells={stats.unique_cell_keys}, "
-                f"cache_hits={stats.cache_hits}, "
-                f"cache_misses={stats.cache_misses}, "
-                f"missing_or_invalid={stats.skipped_missing + stats.skipped_invalid}, "
-                f"opencell_failed={stats.opencell_failed}."
-            )
+                    print_status("Batch update completed successfully.")
+                    if args.verbose:
+                        print_status(
+                            "Summary: "
+                            f"online={stats.total_online}, "
+                            f"processed={stats.processed}, "
+                            f"prepared={stats.ready_for_upload}, "
+                            f"unique_cells={stats.unique_cell_keys}, "
+                            f"cache_hits={stats.cache_hits}, "
+                            f"cache_misses={stats.cache_misses}, "
+                            f"missing_or_invalid={stats.skipped_missing + stats.skipped_invalid}, "
+                            f"opencell_failed={stats.opencell_failed}."
+                        )
+
+                    if config.run_interval_hours == 0:
+                        break
+
+                    wait_for_next_run(config.run_interval_hours, logger, "successful cycle")
+                except AppError as exc:
+                    if config.run_interval_hours == 0:
+                        raise
+                    logger.error("Scheduled batch cycle failed: %s", exc)
+                    print_status(f"Batch cycle failed: {exc}")
+                    wait_for_next_run(config.run_interval_hours, logger, "failed cycle")
         return 0
     except AppError as exc:
-        logger.error("Application error: %s", exc)
+        if "logger" in locals():
+            logger.error("Application error: %s", exc)
         print(f"Application error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        logger.warning("Execution interrupted by user.")
+        if "logger" in locals():
+            logger.warning("Execution interrupted by user.")
         print("Operation cancelled by user.", file=sys.stderr)
         return 130
     except Exception as exc:  # pragma: no cover
-        logger.exception("Unexpected application failure.")
+        if "logger" in locals():
+            logger.exception("Unexpected application failure.")
         print(f"Unexpected error: {exc}", file=sys.stderr)
         return 1
 

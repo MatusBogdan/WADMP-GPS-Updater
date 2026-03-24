@@ -18,7 +18,7 @@ The script validates input, handles common network and API failures, and writes 
 
 ## Prerequisites
 
-- Windows with Python 3.11 or newer installed
+- Windows or Linux with Python 3.11 or newer installed
 - Network access to the WADMP environment
 - A valid WADMP username and password
 - A valid OpenCell / Unwired Labs token
@@ -26,7 +26,7 @@ The script validates input, handles common network and API failures, and writes 
 
 ## Installation
 
-1. Open a Windows console in the project directory.
+1. Open a terminal in the project directory.
 2. Install dependencies:
 
 ```powershell
@@ -60,7 +60,10 @@ python -m pip install -r requirements.txt
 - `DMP_ONLINE_VALUE`: Value used to identify online devices. Default: `1`
 - `DMP_MNC_LENGTH`: Set to `2` or `3` if PLMN parsing requires explicit MNC length
 - `DMP_BATCH_PAGE_SIZE`: Number of devices per page in batch mode. Default: `100`
+- `RUN_INTERVAL_HOURS`: `0` runs the batch once. A positive integer repeats the batch every N hours until the process is stopped. Allowed range: `0` to `720`. Default: `0`
 - `OPENCELL_CACHE_PATH`: Path to the persistent OpenCell cache JSON file. Default: `opencell_cache.json`
+- `OUTPUT_RETENTION_DAYS`: Delete generated CSV files in `output` older than this number of days. Default: `14`
+- `LOG_RETENTION_DAYS`: Delete `app.log` if it is older than this number of days. Allowed range: `1` to `90`. Default: `14`
 - `DMP_LONG_OPERATION_PATH`: Long operation detail endpoint path. Default: `/long-operations/{operation_id}`
 - `DMP_LONG_OPERATION_POLL_SECONDS`: Poll interval for long operation status checks. Default: `2`
 - `DMP_LONG_OPERATION_TIMEOUT_SECONDS`: Maximum wait time for long operation completion. Default: `120`
@@ -69,11 +72,19 @@ python -m pip install -r requirements.txt
 
 ## Running the Script
 
-Standard batch mode:
+Standard one-time batch mode:
 
 ```powershell
 python wadmp_gps_updater.py
 ```
+
+Repeated batch mode every 2 hours:
+
+```env
+RUN_INTERVAL_HOURS="2"
+```
+
+The process will keep running until it is stopped with `Ctrl+C`.
 
 Verbose mode:
 
@@ -106,11 +117,15 @@ Batch CSV write:
 - `Prepared N GPS updates. Uploading CSV to WADMP...`
 - `CSV accepted by WADMP. Waiting for long operation ID...`
 - `Batch update completed successfully.`
+- `Batch cycle failed: ...`
+- `Next resync will run in N hour(s) at YYYY-MM-DD HH:MM:SS. Press Ctrl+C to stop.`
 
 ## Logging
 
 The script writes logs to `app.log`.
 It also saves every generated batch CSV file to the `output` directory before upload.
+CSV files in `output` older than 14 days are deleted automatically at startup by default.
+The main `app.log` file is also deleted automatically if it is older than the configured retention period.
 The upload uses that saved CSV file directly through the Python `requests` multipart upload, following the same simple file-post pattern used by the WADMP developers.
 The generated CSV uses `;` as the delimiter because that is required by the WADMP CSV import endpoint.
 
@@ -121,9 +136,12 @@ The log includes:
 - Batch page loading summaries
 - OpenCell request summaries
 - OpenCell cache load/save summaries
+- Output cleanup summaries
 - Saved CSV file path
 - CSV upload summary
 - Long operation polling summaries
+- Scheduled next-run summaries
+- Scheduled retry summaries after failed cycles
 - Errors and stack traces
 
 Sensitive values such as passwords and full bearer tokens are not written to the log.
@@ -139,6 +157,7 @@ Sensitive values such as passwords and full bearer tokens are not written to the
 - Devices with missing or invalid `MoPlmn`, `MoCell`, or `MacAddress` are skipped.
 - OpenCell results are cached by `MCC + MNC + Cell ID`, so repeated BTS lookups are reused across devices and across runs.
 - The OpenCell lookup is best-effort because TAC is not available in WADMP.
+- If `RUN_INTERVAL_HOURS` is greater than `0`, a failed cycle is logged and the application continues with the next scheduled run instead of exiting immediately.
 
 ## Typical Errors and Troubleshooting
 
