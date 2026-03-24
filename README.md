@@ -2,9 +2,9 @@
 
 ## What This Application Does
 
-This console application reads LTE cell information stored in WADMP for a device identified by MAC address, queries the OpenCell / Unwired Labs API for approximate coordinates, and writes the resulting latitude, longitude, and altitude back to WADMP.
+This console application is designed for bulk processing of WADMP routers. It reads LTE cell information for all online routers in a company, queries the OpenCell / Unwired Labs API for approximate coordinates, and writes the resulting latitude, longitude, and altitude back to WADMP through a CSV bulk update.
 
-The script supports both interactive mode and a `--mac` command line argument. It validates input, handles common network and API failures, and writes technical diagnostics to `app.log`.
+The script validates input, handles common network and API failures, and writes technical diagnostics to `app.log`.
 
 ## File Structure
 
@@ -22,6 +22,7 @@ The script supports both interactive mode and a `--mac` command line argument. I
 - Network access to the WADMP environment
 - A valid WADMP username and password
 - A valid OpenCell / Unwired Labs token
+- A valid WADMP company ID
 
 ## Installation
 
@@ -42,83 +43,87 @@ python -m pip install -r requirements.txt
 - `OPENCELL_TOKEN`: OpenCell / Unwired Labs API token
 - `DMP_USERNAME`: WADMP login name
 - `DMP_PASSWORD`: WADMP login password
-- `OPENCELL_API_URL`: OpenCell API URL, for example `https://eu1.unwiredlabs.com/v2/process.php`
-- `DMP_TOKEN_URL`: OAuth2 token endpoint URL, for example `https://gateway.wadmp3.com/public/auth/connect/token`
-- `DMP_API_BASE_URL`: WADMP API base URL, for example `https://gateway.wadmp3.com/api`
-- `DMP_PLMN_FIELD`: Monitoring field name that stores the PLMN value, for example `MoPlmn`
-- `DMP_CELL_FIELD`: Monitoring field name that stores the cell identifier, for example `MoCell`
+- `DMP_COMPANY_ID`: Company ID used for bulk reading online devices and CSV upload
+- `DMP_TOKEN_URL`: OAuth2 token endpoint URL
+- `DMP_API_BASE_URL`: WADMP API base URL
+- `OPENCELL_API_URL`: OpenCell API URL
+- `DMP_PLMN_FIELD`: Monitoring field name storing PLMN, for example `MoPlmn`
+- `DMP_CELL_FIELD`: Monitoring field name storing cell ID, for example `MoCell`
 - `DMP_GPS_LAT_FIELD`: GPS latitude field name, for example `GpsLat`
 - `DMP_GPS_LON_FIELD`: GPS longitude field name, for example `GpsLon`
 - `DMP_GPS_ALT_FIELD`: GPS altitude field name, for example `GpsAlt`
 
 ### Optional Configuration Values
 
-- `DMP_MAC`: Default MAC address if `--mac` is not supplied
-- `DMP_MNC_LENGTH`: Set to `2` or `3` if the PLMN format in your network requires explicit MNC length
+- `DMP_MAC_ADDRESS_FIELD`: Device MAC field name for batch read. Default: `MacAddress`
+- `DMP_ONLINE_FIELD`: Device online status field name. Default: `Online`
+- `DMP_ONLINE_VALUE`: Value used to identify online devices. Default: `1`
+- `DMP_MNC_LENGTH`: Set to `2` or `3` if PLMN parsing requires explicit MNC length
+- `DMP_BATCH_PAGE_SIZE`: Number of devices per page in batch mode. Default: `100`
+- `OPENCELL_CACHE_PATH`: Path to the persistent OpenCell cache JSON file. Default: `opencell_cache.json`
+- `DMP_LONG_OPERATION_PATH`: Long operation detail endpoint path. Default: `/long-operations/{operation_id}`
+- `DMP_LONG_OPERATION_POLL_SECONDS`: Poll interval for long operation status checks. Default: `2`
+- `DMP_LONG_OPERATION_TIMEOUT_SECONDS`: Maximum wait time for long operation completion. Default: `120`
 - `REQUEST_TIMEOUT_SECONDS`: HTTP timeout in seconds. Default: `20`
 - `VERIFY_TLS`: `true` or `false`. Default: `true`
 
 ## Running the Script
 
-Interactive mode:
+Standard batch mode:
 
 ```powershell
 python wadmp_gps_updater.py
 ```
 
-Direct MAC address mode:
-
-```powershell
-python wadmp_gps_updater.py --mac AA:BB:CC:DD:EE:FF
-```
-
 Verbose mode:
 
 ```powershell
-python wadmp_gps_updater.py --mac AA:BB:CC:DD:EE:FF --verbose
+python wadmp_gps_updater.py --verbose
 ```
 
 Custom configuration file:
 
 ```powershell
-python wadmp_gps_updater.py --config custom-config.env
+python wadmp_gps_updater.py --config custom-config.env --verbose
 ```
 
-## Accepted MAC Address Formats
+## Confirmed WADMP API Flow
 
-The script accepts these formats:
+Batch read:
 
-- `AA:BB:CC:DD:EE:FF`
-- `AA-BB-CC-DD-EE-FF`
-- `AABBCCDDEEFF`
+- `POST /monitoring/devices/companies/{companyId}`
 
-The MAC address is normalized internally before use.
+Batch CSV write:
+
+- `POST /management/devices/long-operations/fields/csv`
 
 ## Console Flow
 
-Typical output:
-
 - `Authenticating to WADMP...`
-- `Reading device data from WADMP...`
-- `Device found.`
-- `Reading cellular fields...`
-- `Querying OpenCell API...`
-- `Updating WADMP GPS fields...`
-- `Update completed successfully.`
+- `Reading online devices from WADMP...`
+- `Loaded N online devices.`
+- `Querying OpenCell API for online devices...`
+- `Prepared N GPS updates. Uploading CSV to WADMP...`
+- `CSV accepted by WADMP. Waiting for long operation ID...`
+- `Batch update completed successfully.`
 
 ## Logging
 
 The script writes logs to `app.log`.
+It also saves every generated batch CSV file to the `output` directory before upload.
+The upload uses that saved CSV file directly through the Python `requests` multipart upload, following the same simple file-post pattern used by the WADMP developers.
+The generated CSV uses `;` as the delimiter because that is required by the WADMP CSV import endpoint.
 
 The log includes:
 
 - Startup
-- Entered MAC address
 - Authentication success or failure
-- Cellular field values read from WADMP
-- OpenCell request summary
-- OpenCell response summary
-- WADMP update summary
+- Batch page loading summaries
+- OpenCell request summaries
+- OpenCell cache load/save summaries
+- Saved CSV file path
+- CSV upload summary
+- Long operation polling summaries
 - Errors and stack traces
 
 Sensitive values such as passwords and full bearer tokens are not written to the log.
@@ -128,10 +133,12 @@ Sensitive values such as passwords and full bearer tokens are not written to the
 - Cell ID can be stored as a decimal or hexadecimal string.
 - Values beginning with `0x` are treated as hexadecimal.
 - Values containing hexadecimal letters `A-F` are also treated as hexadecimal.
-- The script reads `PLMN` and splits it into `MCC` and `MNC`.
+- The script reads PLMN and splits it into MCC and MNC.
 - If `DMP_MNC_LENGTH` is not set, a 5-digit PLMN is interpreted as `3+2` and a 6-digit PLMN as `3+3`.
 - GPS altitude is always written as numeric `0`.
-- The OpenCell lookup is best-effort because the current WADMP design does not provide TAC.
+- Devices with missing or invalid `MoPlmn`, `MoCell`, or `MacAddress` are skipped.
+- OpenCell results are cached by `MCC + MNC + Cell ID`, so repeated BTS lookups are reused across devices and across runs.
+- The OpenCell lookup is best-effort because TAC is not available in WADMP.
 
 ## Typical Errors and Troubleshooting
 
@@ -143,44 +150,28 @@ Create `config.env` from `config.env.example` and verify the file path.
 
 Check `config.env` for invalid lines. Each line must use `KEY=value` format.
 
-### `Invalid MAC address`
-
-Use one of the accepted MAC formats and make sure it contains exactly 12 hexadecimal characters.
-
-### `WADMP authentication failed`
+### `No online devices were returned by WADMP`
 
 Verify:
 
-- Username and password
-- Token URL
-- Network access to WADMP
-- TLS settings if your environment uses a private certificate
+- The company ID is correct
+- The `DMP_ONLINE_FIELD` and `DMP_ONLINE_VALUE` match your WADMP environment
+- The account can access the company devices
 
-### `No device found for the specified MAC address`
-
-Confirm that:
-
-- The MAC address belongs to a device in WADMP
-- The monitoring endpoint is reachable
-- The configured `DMP_PLMN_FIELD` and `DMP_CELL_FIELD` exist for the device
-
-### `Required WADMP field is missing` or `Required WADMP field is empty`
-
-Make sure the configured field names match the exact names used in WADMP and that the device record already contains the PLMN and Cell ID values.
-
-### `OpenCell lookup returned no coordinates`
+### `No GPS updates were generated for online devices`
 
 Possible causes:
 
-- No match for the supplied LTE data
-- Invalid PLMN or Cell ID values
-- Incorrect MCC or MNC split
-- API token issue or request quota problem
+- Online devices are missing `MoPlmn` or `MoCell`
+- PLMN parsing failed
+- OpenCell returned no match for all devices
 
-### `WADMP GPS update failed`
+### `WADMP CSV GPS update failed`
 
 Check:
 
+- The company ID
+- The CSV target field names
 - User permissions in WADMP
 - Whether the configured GPS fields are writable
 
@@ -193,12 +184,3 @@ Verify DNS resolution, proxy settings, firewall rules, VPN access, and whether t
 - `0`: Success
 - `1`: Application or runtime error
 - `130`: Cancelled by user
-
-## Notes About WADMP API Paths
-
-The script uses:
-
-- Device lookup path: `/monitoring/devices/{macAddress}`
-- GPS update path: `/management/devices/{macAddress}`
-
-The lookup reads the configured monitoring fields such as `MoPlmn` and `MoCell`. The update writes `GpsLat`, `GpsLon`, and `GpsAlt` directly to the device management endpoint.

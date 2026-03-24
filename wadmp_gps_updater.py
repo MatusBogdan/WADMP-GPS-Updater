@@ -1,11 +1,15 @@
 import argparse
+import csv
+import io
+import json
 import logging
 import re
 import sys
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import requests
 from requests import Response, Session
@@ -14,9 +18,17 @@ from requests.exceptions import ConnectionError, RequestException, Timeout
 
 DEFAULT_CONFIG_PATH = Path("config.env")
 DEFAULT_LOG_PATH = Path("app.log")
+DEFAULT_OUTPUT_DIR = Path("output")
+DEFAULT_CACHE_PATH = Path("opencell_cache.json")
 DEFAULT_TIMEOUT_SECONDS = 20
-DEFAULT_MONITORING_DEVICE_PATH = "/monitoring/devices/{mac_address}"
-DEFAULT_UPDATE_DEVICE_PATH = "/management/devices/{mac_address}"
+DEFAULT_BATCH_PAGE_SIZE = 100
+DEFAULT_MONITORING_COMPANY_PATH = "/monitoring/devices/companies/{company_id}"
+DEFAULT_UPDATE_CSV_PATH = "/management/devices/long-operations/fields/csv"
+DEFAULT_LONG_OPERATION_PATH = "/long-operations/{operation_id}"
+DEFAULT_ONLINE_FIELD = "Online"
+DEFAULT_ONLINE_VALUE = "1"
+DEFAULT_LONG_OPERATION_POLL_SECONDS = 2
+DEFAULT_LONG_OPERATION_TIMEOUT_SECONDS = 120
 MAC_PATTERN = re.compile(r"^[0-9A-Fa-f]{12}$")
 
 
@@ -31,6 +43,7 @@ class FieldNames:
     gps_latitude: str
     gps_longitude: str
     gps_altitude: str
+    mac_address: str = "MacAddress"
 
 
 @dataclass(frozen=True)
@@ -42,10 +55,17 @@ class Config:
     dmp_api_base_url: str
     opencell_api_url: str
     fields: FieldNames
+    company_id: int
+    online_field: str = DEFAULT_ONLINE_FIELD
+    online_value: str = DEFAULT_ONLINE_VALUE
+    batch_page_size: int = DEFAULT_BATCH_PAGE_SIZE
     mnc_length: int | None = None
-    default_mac: str | None = None
-    monitoring_device_path: str = DEFAULT_MONITORING_DEVICE_PATH
-    update_device_path: str = DEFAULT_UPDATE_DEVICE_PATH
+    cache_path: Path = DEFAULT_CACHE_PATH
+    monitoring_company_path: str = DEFAULT_MONITORING_COMPANY_PATH
+    update_csv_path: str = DEFAULT_UPDATE_CSV_PATH
+    long_operation_path: str = DEFAULT_LONG_OPERATION_PATH
+    long_operation_poll_seconds: int = DEFAULT_LONG_OPERATION_POLL_SECONDS
+    long_operation_timeout_seconds: int = DEFAULT_LONG_OPERATION_TIMEOUT_SECONDS
     request_timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     verify_tls: bool = True
 
@@ -65,8 +85,30 @@ class OpenCellResult:
 
 
 @dataclass(frozen=True)
-class DeviceRecord:
+class BatchDevice:
     fields: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class CsvUpdateRow:
+    mac_address: str
+    latitude: float
+    longitude: float
+    altitude: int = 0
+
+
+@dataclass
+class BatchStats:
+    total_online: int = 0
+    total_loaded: int = 0
+    processed: int = 0
+    skipped_missing: int = 0
+    skipped_invalid: int = 0
+    opencell_failed: int = 0
+    ready_for_upload: int = 0
+    unique_cell_keys: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
 
 
 def setup_logging(verbose: bool) -> logging.Logger:
@@ -110,6 +152,7 @@ def load_config(config_path: Path) -> Config:
         "OPENCELL_TOKEN",
         "DMP_USERNAME",
         "DMP_PASSWORD",
+        "DMP_COMPANY_ID",
         "OPENCELL_API_URL",
         "DMP_TOKEN_URL",
         "DMP_API_BASE_URL",
@@ -142,9 +185,18 @@ def load_config(config_path: Path) -> Config:
         if mnc_length not in (2, 3):
             raise AppError("Configuration value 'DMP_MNC_LENGTH' must be 2 or 3.")
 
-    default_mac = raw.get("DMP_MAC", "").strip() or None
-    if default_mac is not None:
-        default_mac = normalize_mac_address(default_mac)
+    batch_page_size = parse_positive_int(
+        raw.get("DMP_BATCH_PAGE_SIZE", str(DEFAULT_BATCH_PAGE_SIZE)),
+        "DMP_BATCH_PAGE_SIZE",
+    )
+    long_operation_poll_seconds = parse_positive_int(
+        raw.get("DMP_LONG_OPERATION_POLL_SECONDS", str(DEFAULT_LONG_OPERATION_POLL_SECONDS)),
+        "DMP_LONG_OPERATION_POLL_SECONDS",
+    )
+    long_operation_timeout_seconds = parse_positive_int(
+        raw.get("DMP_LONG_OPERATION_TIMEOUT_SECONDS", str(DEFAULT_LONG_OPERATION_TIMEOUT_SECONDS)),
+        "DMP_LONG_OPERATION_TIMEOUT_SECONDS",
+    )
 
     return Config(
         dmp_username=read_text_key("DMP_USERNAME"),
@@ -159,9 +211,17 @@ def load_config(config_path: Path) -> Config:
             gps_latitude=read_text_key("DMP_GPS_LAT_FIELD"),
             gps_longitude=read_text_key("DMP_GPS_LON_FIELD"),
             gps_altitude=read_text_key("DMP_GPS_ALT_FIELD"),
+            mac_address=raw.get("DMP_MAC_ADDRESS_FIELD", "MacAddress").strip() or "MacAddress",
         ),
+        company_id=parse_positive_int(read_text_key("DMP_COMPANY_ID"), "DMP_COMPANY_ID"),
+        online_field=raw.get("DMP_ONLINE_FIELD", DEFAULT_ONLINE_FIELD).strip() or DEFAULT_ONLINE_FIELD,
+        online_value=raw.get("DMP_ONLINE_VALUE", DEFAULT_ONLINE_VALUE).strip() or DEFAULT_ONLINE_VALUE,
+        batch_page_size=batch_page_size,
         mnc_length=mnc_length,
-        default_mac=default_mac,
+        cache_path=Path(raw.get("OPENCELL_CACHE_PATH", str(DEFAULT_CACHE_PATH)).strip() or str(DEFAULT_CACHE_PATH)),
+        long_operation_path=raw.get("DMP_LONG_OPERATION_PATH", DEFAULT_LONG_OPERATION_PATH).strip() or DEFAULT_LONG_OPERATION_PATH,
+        long_operation_poll_seconds=long_operation_poll_seconds,
+        long_operation_timeout_seconds=long_operation_timeout_seconds,
         request_timeout_seconds=timeout_value,
         verify_tls=verify_tls,
     )
@@ -212,19 +272,11 @@ def normalize_mac_address(mac_address: str) -> str:
     compact = re.sub(r"[^0-9A-Fa-f]", "", mac_address or "")
     if not MAC_PATTERN.fullmatch(compact):
         raise AppError(
-            "Invalid MAC address. Accepted formats: AA:BB:CC:DD:EE:FF, "
-            "AA-BB-CC-DD-EE-FF, AABBCCDDEEFF."
+            "Invalid MAC address encountered in WADMP data. "
+            "Expected 12 hexadecimal characters."
         )
     compact = compact.upper()
     return ":".join(compact[index:index + 2] for index in range(0, 12, 2))
-
-
-def read_mac_address(cli_mac: str | None, config: Config) -> str:
-    if cli_mac:
-        return normalize_mac_address(cli_mac)
-    if config.default_mac:
-        return config.default_mac
-    return normalize_mac_address(input("Enter device MAC address: ").strip())
 
 
 def mask_secret(value: str, keep_start: int = 4, keep_end: int = 2) -> str:
@@ -315,59 +367,121 @@ def build_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
-def get_device_by_mac(
+def build_json_headers(access_token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json-patch+json",
+    }
+
+def fetch_online_devices(
     session: Session,
     config: Config,
     access_token: str,
-    mac_address: str,
     logger: logging.Logger,
-) -> DeviceRecord:
-    encoded_mac = quote(mac_address, safe="")
+) -> list[BatchDevice]:
+    devices: list[BatchDevice] = []
+    page = 1
+    total_items: int | None = None
+
+    while True:
+        page_items, current_total = fetch_online_devices_page(
+            session,
+            config,
+            access_token,
+            page,
+            logger,
+        )
+        if total_items is None:
+            total_items = current_total
+            logger.info("Batch read total online devices reported by WADMP: %s", total_items)
+
+        if not page_items:
+            break
+
+        devices.extend(page_items)
+        logger.info(
+            "Loaded online devices page=%s page_items=%s accumulated=%s",
+            page,
+            len(page_items),
+            len(devices),
+        )
+
+        if len(devices) >= current_total:
+            break
+        page += 1
+
+    return devices
+
+
+def fetch_online_devices_page(
+    session: Session,
+    config: Config,
+    access_token: str,
+    page: int,
+    logger: logging.Logger,
+) -> tuple[list[BatchDevice], int]:
     url = build_url(
         config.dmp_api_base_url,
-        config.monitoring_device_path.format(mac_address=encoded_mac),
+        config.monitoring_company_path.format(company_id=config.company_id),
     )
-    headers = {"Authorization": f"Bearer {access_token}"}
-    params = [("fields", config.fields.plmn), ("fields", config.fields.cell_id)]
+    payload = {
+        "filters": [
+            {
+                "field_name": config.online_field,
+                "rule": {
+                    "operator_id": "Equals",
+                    "operands": [config.online_value],
+                },
+            }
+        ],
+        "fields": [
+            {"name": config.fields.mac_address},
+            {"name": config.fields.plmn},
+            {"name": config.fields.cell_id},
+        ],
+        "page": page,
+        "page_size": config.batch_page_size,
+    }
 
-    logger.info("Looking up device by MAC. url=%s mac=%s", url, mac_address)
+    logger.info(
+        "Requesting online devices page. url=%s company_id=%s page=%s page_size=%s",
+        url,
+        config.company_id,
+        page,
+        config.batch_page_size,
+    )
     response = perform_request(
         session,
-        "GET",
+        "POST",
         url,
         timeout=config.request_timeout_seconds,
         logger=logger,
-        action="WADMP device lookup",
+        action=f"WADMP online device list page {page}",
         verify_tls=config.verify_tls,
-        headers=headers,
-        params=params,
+        headers=build_json_headers(access_token),
+        data=json.dumps(payload),
     )
-    data = ensure_success_json(response, "WADMP device lookup")
-
+    data = ensure_success_json(response, f"WADMP online device list page {page}")
     if data.get("success") is False:
-        message = data.get("message") or "lookup was rejected by WADMP"
-        raise AppError(f"WADMP device lookup failed: {message}")
+        message = data.get("message") or "WADMP rejected the online device list request"
+        raise AppError(f"WADMP online device list failed: {message}")
 
-    device_payload = extract_device_payload(data)
-    fields = extract_fields_map(device_payload)
+    raw_items = data.get("data")
+    if not isinstance(raw_items, list):
+        raise AppError("WADMP online device list returned an unexpected result format.")
 
-    logger.info("Device lookup succeeded. field_count=%s", len(fields))
-    return DeviceRecord(fields=fields)
+    total_items = data.get("total_items")
+    if not isinstance(total_items, int) or total_items < 0:
+        raise AppError("WADMP online device list did not return a valid total_items value.")
 
+    page_items: list[BatchDevice] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        page_items.append(BatchDevice(fields=extract_fields_map(item)))
 
-def extract_device_payload(data: Any) -> dict[str, Any]:
-    if isinstance(data, dict):
-        if "data" in data and isinstance(data["data"], dict):
-            return data["data"]
-        if "data" in data and isinstance(data["data"], list):
-            if not data["data"]:
-                raise AppError("No device found for the specified MAC address.")
-            first_item = data["data"][0]
-            if isinstance(first_item, dict):
-                return first_item
-        if isinstance(data, dict):
-            return data
-    raise AppError("WADMP device lookup returned an unexpected result format.")
+    return page_items, total_items
 
 
 def extract_fields_map(device_payload: dict[str, Any]) -> dict[str, Any]:
@@ -462,6 +576,67 @@ def extract_cellular_data(fields: dict[str, Any], config: Config, logger: loggin
     return cellular_data
 
 
+def build_cell_cache_key(cellular_data: CellularData) -> str:
+    return f"{cellular_data.mcc}|{cellular_data.mnc}|{cellular_data.cell_id}"
+
+
+def load_opencell_cache(cache_path: Path, logger: logging.Logger) -> dict[str, OpenCellResult]:
+    if not cache_path.exists():
+        logger.info("OpenCell cache file does not exist yet. path=%s", cache_path)
+        return {}
+
+    try:
+        raw_data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("OpenCell cache could not be loaded. Starting with empty cache. path=%s", cache_path)
+        return {}
+
+    if not isinstance(raw_data, dict):
+        logger.warning("OpenCell cache has invalid structure. Starting with empty cache. path=%s", cache_path)
+        return {}
+
+    cache: dict[str, OpenCellResult] = {}
+    for key, value in raw_data.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        latitude = value.get("latitude")
+        longitude = value.get("longitude")
+        accuracy = value.get("accuracy")
+        if not isinstance(latitude, (int, float)) or not isinstance(longitude, (int, float)):
+            continue
+        accuracy_value = float(accuracy) if isinstance(accuracy, (int, float)) else None
+        cache[key] = OpenCellResult(
+            latitude=float(latitude),
+            longitude=float(longitude),
+            accuracy=accuracy_value,
+        )
+
+    logger.info("Loaded OpenCell cache entries. path=%s entries=%s", cache_path, len(cache))
+    return cache
+
+
+def save_opencell_cache(
+    cache_path: Path,
+    cache: dict[str, OpenCellResult],
+    logger: logging.Logger,
+) -> None:
+    serializable = {
+        key: {
+            "latitude": value.latitude,
+            "longitude": value.longitude,
+            "accuracy": value.accuracy,
+        }
+        for key, value in cache.items()
+    }
+    try:
+        cache_path.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to save OpenCell cache. path=%s error=%s", cache_path, exc)
+        return
+
+    logger.info("Saved OpenCell cache entries. path=%s entries=%s", cache_path, len(cache))
+
+
 def query_opencell(
     session: Session,
     config: Config,
@@ -522,72 +697,269 @@ def query_opencell(
         accuracy=accuracy_value,
     )
 
+def build_csv_payload(rows: list[CsvUpdateRow], config: Config) -> bytes:
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer, delimiter=";")
+    writer.writerow(
+        [
+            config.fields.mac_address,
+            config.fields.gps_latitude,
+            config.fields.gps_longitude,
+            config.fields.gps_altitude,
+        ]
+    )
+    for row in rows:
+        writer.writerow([row.mac_address, row.latitude, row.longitude, row.altitude])
+    return buffer.getvalue().encode("utf-8")
 
-def update_gps_fields(
+
+def save_csv_payload(csv_bytes: bytes, logger: logging.Logger) -> Path:
+    DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = DEFAULT_OUTPUT_DIR / f"gps_updates_{timestamp}.csv"
+    output_path.write_bytes(csv_bytes)
+    logger.info("Saved GPS CSV payload to disk. path=%s", output_path)
+    return output_path
+
+
+def wait_for_long_operation(
     session: Session,
     config: Config,
     access_token: str,
-    mac_address: str,
-    result: OpenCellResult,
+    operation_id: int,
     logger: logging.Logger,
 ) -> None:
-    encoded_mac = quote(mac_address, safe="")
     url = build_url(
         config.dmp_api_base_url,
-        config.update_device_path.format(mac_address=encoded_mac),
+        config.long_operation_path.format(operation_id=operation_id),
     )
-    headers = {"Authorization": f"Bearer {access_token}"}
-    payload = {
-        "data": [
-            {"field_name": config.fields.gps_latitude, "value": result.latitude},
-            {"field_name": config.fields.gps_longitude, "value": result.longitude},
-            {"field_name": config.fields.gps_altitude, "value": 0},
-        ]
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+    deadline = time.monotonic() + config.long_operation_timeout_seconds
+    last_logged_state: str | None = None
+
+    while True:
+        response = perform_request(
+            session,
+            "GET",
+            url,
+            timeout=config.request_timeout_seconds,
+            logger=logger,
+            action=f"WADMP long operation status {operation_id}",
+            verify_tls=config.verify_tls,
+            headers=headers,
+        )
+        result = ensure_success_json(response, f"WADMP long operation status {operation_id}")
+        if isinstance(result, dict) and result.get("success") is False:
+            message = result.get("message") or "unknown long operation error"
+            raise AppError(f"WADMP long operation failed: {message}")
+
+        data = result.get("data")
+        if not isinstance(data, dict):
+            raise AppError("WADMP long operation status returned an unexpected result format.")
+
+        state = str(data.get("state", "")).strip()
+        failed_items = data.get("failed_items")
+        operation_result = data.get("result")
+        if state != last_logged_state:
+            logger.info(
+                "Long operation status changed. operation_id=%s state=%s failed_items=%s",
+                operation_id,
+                state,
+                failed_items,
+            )
+            last_logged_state = state
+
+        if state == "Finished":
+            if isinstance(failed_items, int) and failed_items > 0:
+                raise AppError(
+                    f"WADMP long operation finished with {failed_items} failed item(s)."
+                )
+            return
+
+        if state == "FinishedWithErrors":
+            raise AppError(build_long_operation_error_message(operation_result, failed_items))
+
+        if state in {"Failed", "Canceled", "Cancelled"}:
+            raise AppError(f"WADMP long operation ended with state '{state}'.")
+
+        if time.monotonic() >= deadline:
+            raise AppError(
+                f"WADMP long operation did not finish within {config.long_operation_timeout_seconds} seconds."
+            )
+
+        time.sleep(config.long_operation_poll_seconds)
+
+
+def build_long_operation_error_message(operation_result: Any, failed_items: Any) -> str:
+    if isinstance(operation_result, dict):
+        items = operation_result.get("failed_items")
+        if isinstance(items, list) and items:
+            first_item = items[0]
+            if isinstance(first_item, dict):
+                identifier = str(first_item.get("identifier", "")).strip()
+                error_message = str(first_item.get("error_message", "")).strip()
+                details = []
+                if identifier:
+                    details.append(f"identifier={identifier}")
+                if error_message:
+                    details.append(f"error={error_message}")
+                if details:
+                    return "WADMP long operation finished with errors: " + ", ".join(details)
+
+    if isinstance(failed_items, int) and failed_items > 0:
+        return f"WADMP long operation finished with {failed_items} failed item(s)."
+
+    return "WADMP long operation finished with errors."
+
+
+def upload_csv_updates(
+    session: Session,
+    config: Config,
+    access_token: str,
+    rows: list[CsvUpdateRow],
+    logger: logging.Logger,
+) -> int:
+    csv_bytes = build_csv_payload(rows, config)
+    output_path = save_csv_payload(csv_bytes, logger)
+    url = build_url(config.dmp_api_base_url, config.update_csv_path)
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+    data = {
+        "CompanyId": str(config.company_id),
     }
 
     logger.info(
-        "Updating WADMP GPS fields. url=%s mac=%s payload=%s",
+        "Uploading GPS CSV update. url=%s company_id=%s row_count=%s csv_size_bytes=%s csv_path=%s",
         url,
-        mac_address,
-        payload,
+        config.company_id,
+        len(rows),
+        len(csv_bytes),
+        output_path,
     )
-    response = perform_request(
-        session,
-        "POST",
-        url,
-        timeout=config.request_timeout_seconds,
-        logger=logger,
-        action="WADMP GPS update",
-        verify_tls=config.verify_tls,
-        headers=headers,
-        json=payload,
-    )
-    if response.status_code not in (200, 201, 202, 204):
-        detail = safe_response_text(response)
-        raise AppError(f"WADMP GPS update failed with HTTP {response.status_code}: {detail}")
+    with output_path.open("rb") as file_handle:
+        files = {"File": file_handle}
+        response = perform_request(
+            session,
+            "POST",
+            url,
+            timeout=config.request_timeout_seconds,
+            logger=logger,
+            action="WADMP CSV GPS update",
+            verify_tls=config.verify_tls,
+            headers=headers,
+            files=files,
+            data=data,
+        )
+    result = ensure_success_json(response, "WADMP CSV GPS update")
+    if isinstance(result, dict) and result.get("success") is False:
+        message = result.get("message") or "unknown CSV upload error"
+        raise AppError(f"WADMP CSV GPS update failed: {message}")
 
-    if response.content:
-        data = ensure_success_json(response, "WADMP GPS update")
-        if isinstance(data, dict) and data.get("success") is False:
-            message = data.get("message") or "unknown update error"
-            raise AppError(f"WADMP GPS update failed: {message}")
+    data = result.get("data")
+    if not isinstance(data, dict):
+        raise AppError("WADMP CSV GPS update did not return a valid operation payload.")
 
-    logger.info(
-        "WADMP GPS update succeeded. mac=%s lat=%s lon=%s accuracy=%s",
-        mac_address,
-        result.latitude,
-        result.longitude,
-        result.accuracy,
-    )
+    operation_id = data.get("id")
+    if not isinstance(operation_id, int) or operation_id <= 0:
+        raise AppError("WADMP CSV GPS update did not return a valid long operation ID.")
+
+    logger.info("WADMP CSV GPS update accepted. row_count=%s operation_id=%s", len(rows), operation_id)
+    return operation_id
+
+
+def process_online_devices(
+    session: Session,
+    config: Config,
+    devices: list[BatchDevice],
+    logger: logging.Logger,
+) -> tuple[list[CsvUpdateRow], BatchStats]:
+    rows: list[CsvUpdateRow] = []
+    stats = BatchStats(total_online=len(devices), total_loaded=len(devices))
+    opencell_cache = load_opencell_cache(config.cache_path, logger)
+    unique_keys_seen: set[str] = set()
+
+    for device in devices:
+        stats.processed += 1
+        raw_mac = str(device.fields.get(config.fields.mac_address, "")).strip()
+        try:
+            mac_address = normalize_mac_address(raw_mac)
+        except AppError:
+            stats.skipped_invalid += 1
+            logger.warning("Skipping device with invalid MAC address. raw_mac=%s", raw_mac)
+            continue
+
+        try:
+            cellular_data = extract_cellular_data(device.fields, config, logger)
+        except AppError as exc:
+            stats.skipped_missing += 1
+            logger.warning("Skipping device due to missing or invalid cellular data. mac=%s error=%s", mac_address, exc)
+            continue
+
+        cell_key = build_cell_cache_key(cellular_data)
+        unique_keys_seen.add(cell_key)
+
+        cached_location = opencell_cache.get(cell_key)
+        if cached_location is not None:
+            stats.cache_hits += 1
+            location = cached_location
+            logger.info("Using cached OpenCell result. mac=%s cell_key=%s", mac_address, cell_key)
+        else:
+            stats.cache_misses += 1
+            try:
+                location = query_opencell(session, config, cellular_data, logger)
+            except AppError as exc:
+                stats.opencell_failed += 1
+                logger.warning("Skipping device due to OpenCell failure. mac=%s error=%s", mac_address, exc)
+                continue
+            opencell_cache[cell_key] = location
+
+        rows.append(
+            CsvUpdateRow(
+                mac_address=mac_address,
+                latitude=location.latitude,
+                longitude=location.longitude,
+                altitude=0,
+            )
+        )
+
+    stats.ready_for_upload = len(rows)
+    stats.unique_cell_keys = len(unique_keys_seen)
+    save_opencell_cache(config.cache_path, opencell_cache, logger)
+    return rows, stats
+
+
+def run_batch_mode(
+    session: Session,
+    config: Config,
+    access_token: str,
+    logger: logging.Logger,
+) -> BatchStats:
+    print_status("Reading online devices from WADMP...")
+    devices = fetch_online_devices(session, config, access_token, logger)
+    if not devices:
+        raise AppError("No online devices were returned by WADMP.")
+
+    print_status(f"Loaded {len(devices)} online devices.")
+    print_status("Querying OpenCell API for online devices...")
+    csv_rows, stats = process_online_devices(session, config, devices, logger)
+    if not csv_rows:
+        raise AppError("No GPS updates were generated for online devices.")
+
+    print_status(f"Prepared {len(csv_rows)} GPS updates. Uploading CSV to WADMP...")
+    operation_id = upload_csv_updates(session, config, access_token, csv_rows, logger)
+    print_status(f"CSV accepted by WADMP. Waiting for long operation {operation_id}...")
+    wait_for_long_operation(session, config, access_token, operation_id, logger)
+    return stats
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Update WADMP GPS fields using LTE cell data and OpenCell lookup."
-    )
-    parser.add_argument(
-        "--mac",
-        help="Device MAC address. If omitted, the script uses DMP_MAC or prompts interactively.",
+        description="Update WADMP GPS fields for all online routers using LTE cell data and OpenCell lookup."
     )
     parser.add_argument(
         "--config",
@@ -609,36 +981,29 @@ def run() -> int:
 
     try:
         config = load_config(Path(args.config))
-        mac_address = read_mac_address(args.mac, config)
-        logger.info("Using MAC address: %s", mac_address)
 
         with requests.Session() as session:
             print_status("Authenticating to WADMP...")
             access_token = authenticate_wadmp(session, config, logger)
+            stats = run_batch_mode(session, config, access_token, logger)
 
-            print_status("Reading device data from WADMP...")
-            device = get_device_by_mac(session, config, access_token, mac_address, logger)
-            print_status("Device found.")
-
-            print_status("Reading cellular fields...")
-            cellular_data = extract_cellular_data(device.fields, config, logger)
-
-            print_status("Querying OpenCell API...")
-            location = query_opencell(session, config, cellular_data, logger)
-
-            print_status("Updating WADMP GPS fields...")
-            update_gps_fields(session, config, access_token, mac_address, location, logger)
-
-        print_status("Update completed successfully.")
-        if args.verbose and location.accuracy is not None:
+        print_status("Batch update completed successfully.")
+        if args.verbose:
             print_status(
-                f"Resolved coordinates: latitude={location.latitude}, "
-                f"longitude={location.longitude}, accuracy={location.accuracy} m."
+                "Summary: "
+                f"online={stats.total_online}, "
+                f"processed={stats.processed}, "
+                f"prepared={stats.ready_for_upload}, "
+                f"unique_cells={stats.unique_cell_keys}, "
+                f"cache_hits={stats.cache_hits}, "
+                f"cache_misses={stats.cache_misses}, "
+                f"missing_or_invalid={stats.skipped_missing + stats.skipped_invalid}, "
+                f"opencell_failed={stats.opencell_failed}."
             )
         return 0
     except AppError as exc:
         logger.error("Application error: %s", exc)
-        print(str(exc), file=sys.stderr)
+        print(f"Application error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         logger.warning("Execution interrupted by user.")

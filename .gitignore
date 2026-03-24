@@ -3,3 +3,4 @@ __pycache__/
 
 config.env
 app.log
+opencell_cache.json
