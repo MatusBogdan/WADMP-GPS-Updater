@@ -14,6 +14,8 @@ The script validates input, handles common network and API failures, and writes 
 |-- config.env.example
 |-- requirements.txt
 |-- README.md
+|-- output/
+|-- opencell_cache.json
 |-- deploy/
 |   |-- wadmp-gps-updater.service
 |   |-- wadmp-gps-updater.timer
@@ -36,40 +38,49 @@ The script validates input, handles common network and API failures, and writes 
 python -m pip install -r requirements.txt
 ```
 
+Linux example:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
 ## Configuration
 
 1. Copy `config.env.example` to `config.env`.
 2. Edit `config.env` and fill in all required values.
 
-### Required Configuration Values
+### Required User-Editable Values
 
 - `OPENCELL_TOKEN`: OpenCell / Unwired Labs API token
 - `DMP_USERNAME`: WADMP login name
 - `DMP_PASSWORD`: WADMP login password
 - `DMP_COMPANY_ID`: Company ID used for bulk reading online devices and CSV upload
-- `DMP_TOKEN_URL`: OAuth2 token endpoint URL
-- `DMP_API_BASE_URL`: WADMP API base URL
 - `OPENCELL_API_URL`: OpenCell API URL
-- `DMP_PLMN_FIELD`: Monitoring field name storing PLMN, for example `MoPlmn`
-- `DMP_CELL_FIELD`: Monitoring field name storing cell ID, for example `MoCell`
-- `DMP_GPS_LAT_FIELD`: GPS latitude field name, for example `GpsLat`
-- `DMP_GPS_LON_FIELD`: GPS longitude field name, for example `GpsLon`
-- `DMP_GPS_ALT_FIELD`: GPS altitude field name, for example `GpsAlt`
+- `OUTPUT_RETENTION_DAYS`: Delete generated CSV files in `output` older than this number of days. Default: `14`
+- `LOG_RETENTION_DAYS`: Delete `app.log` if it is older than this number of days. Allowed range: `1` to `90`. Default: `14`
+- `RUN_INTERVAL_HOURS`: `0` runs the batch once. A positive integer repeats the batch every N hours until the process is stopped. Allowed range: `0` to `720`. Default: `0`
 
-### Optional Configuration Values
+### Usually Do Not Change
 
+- `DMP_PLMN_FIELD`: Monitoring field name storing PLMN. Default: `MoPlmn`
+- `DMP_CELL_FIELD`: Monitoring field name storing cell ID. Default: `MoCell`
 - `DMP_MAC_ADDRESS_FIELD`: Device MAC field name for batch read. Default: `MacAddress`
+- `DMP_GPS_LAT_FIELD`: GPS latitude field name. Default: `GpsLat`
+- `DMP_GPS_LON_FIELD`: GPS longitude field name. Default: `GpsLon`
+- `DMP_GPS_ALT_FIELD`: GPS altitude field name. Default: `GpsAlt`
 - `DMP_ONLINE_FIELD`: Device online status field name. Default: `Online`
 - `DMP_ONLINE_VALUE`: Value used to identify online devices. Default: `1`
 - `DMP_MNC_LENGTH`: Set to `2` or `3` if PLMN parsing requires explicit MNC length
 - `DMP_BATCH_PAGE_SIZE`: Number of devices per page in batch mode. Default: `100`
-- `RUN_INTERVAL_HOURS`: `0` runs the batch once. A positive integer repeats the batch every N hours until the process is stopped. Allowed range: `0` to `720`. Default: `0`
 - `OPENCELL_CACHE_PATH`: Path to the persistent OpenCell cache JSON file. Default: `opencell_cache.json`
-- `OUTPUT_RETENTION_DAYS`: Delete generated CSV files in `output` older than this number of days. Default: `14`
-- `LOG_RETENTION_DAYS`: Delete `app.log` if it is older than this number of days. Allowed range: `1` to `90`. Default: `14`
+- `DMP_LONG_OPERATION_TIMEOUT_SECONDS`: Maximum wait time for long operation completion. Default: `120`
+
+### Do Not Change Unless Explicitly Instructed
+
+- `DMP_TOKEN_URL`: OAuth2 token endpoint URL
+- `DMP_API_BASE_URL`: WADMP API base URL
 - `DMP_LONG_OPERATION_PATH`: Long operation detail endpoint path. Default: `/long-operations/{operation_id}`
 - `DMP_LONG_OPERATION_POLL_SECONDS`: Poll interval for long operation status checks. Default: `2`
-- `DMP_LONG_OPERATION_TIMEOUT_SECONDS`: Maximum wait time for long operation completion. Default: `120`
 - `REQUEST_TIMEOUT_SECONDS`: HTTP timeout in seconds. Default: `20`
 - `VERIFY_TLS`: `true` or `false`. Default: `true`
 
@@ -79,6 +90,12 @@ Standard one-time batch mode:
 
 ```powershell
 python wadmp_gps_updater.py
+```
+
+Linux example:
+
+```bash
+python3 wadmp_gps_updater.py
 ```
 
 Repeated batch mode every 2 hours:
@@ -202,6 +219,7 @@ sudo systemctl status wadmp-gps-updater.service
 
 - The Linux `systemd` timer is the preferred production mode.
 - The internal `RUN_INTERVAL_HOURS` loop is still available, but it is better suited for manual terminal runs.
+- If you use the Linux `systemd` timer, do not also use a repeating `RUN_INTERVAL_HOURS` value.
 - If you change the application path, user, or virtualenv path, update the service file accordingly.
 
 ## Console Flow
@@ -220,8 +238,8 @@ sudo systemctl status wadmp-gps-updater.service
 
 The script writes logs to `app.log`.
 It also saves every generated batch CSV file to the `output` directory before upload.
-CSV files in `output` older than 14 days are deleted automatically at startup by default.
-The main `app.log` file is also deleted automatically if it is older than the configured retention period.
+CSV files in `output` older than the configured `OUTPUT_RETENTION_DAYS` value are deleted automatically at startup.
+The main `app.log` file is also deleted automatically at startup if it is older than the configured `LOG_RETENTION_DAYS` value.
 The upload uses that saved CSV file directly through the Python `requests` multipart upload, following the same simple file-post pattern used by the WADMP developers.
 The generated CSV uses `;` as the delimiter because that is required by the WADMP CSV import endpoint.
 
