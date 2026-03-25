@@ -19,9 +19,10 @@ from requests.exceptions import ConnectionError, RequestException, Timeout
 DEFAULT_CONFIG_PATH = Path("config.env")
 DEFAULT_LOG_PATH = Path("app.log")
 DEFAULT_OUTPUT_DIR = Path("output")
-DEFAULT_CACHE_PATH = Path("opencell_cache.json")
+DEFAULT_CACHE_PATH = Path("location_cache.json")
 DEFAULT_TIMEOUT_SECONDS = 20
 DEFAULT_BATCH_PAGE_SIZE = 100
+DEFAULT_LOCATION_PROVIDER = "opencell"
 DEFAULT_MONITORING_COMPANY_PATH = "/monitoring/devices/companies/{company_id}"
 DEFAULT_UPDATE_CSV_PATH = "/management/devices/long-operations/fields/csv"
 DEFAULT_LONG_OPERATION_PATH = "/long-operations/{operation_id}"
@@ -30,6 +31,8 @@ DEFAULT_ONLINE_VALUE = "1"
 DEFAULT_RUN_INTERVAL_HOURS = 0
 DEFAULT_LONG_OPERATION_POLL_SECONDS = 2
 DEFAULT_LONG_OPERATION_TIMEOUT_SECONDS = 120
+DEFAULT_HERE_API_URL = "https://pos.ls.hereapi.com/positioning/v1/locate"
+DEFAULT_HERE_FALLBACK = "area"
 MAC_PATTERN = re.compile(r"^[0-9A-Fa-f]{12}$")
 
 
@@ -49,12 +52,16 @@ class FieldNames:
 
 @dataclass(frozen=True)
 class Config:
+    location_provider: str
     dmp_username: str
     dmp_password: str
-    opencell_token: str
+    opencell_token: str | None
+    here_api_key: str | None
     dmp_token_url: str
     dmp_api_base_url: str
-    opencell_api_url: str
+    opencell_api_url: str | None
+    here_api_url: str
+    here_fallback: str
     fields: FieldNames
     company_id: int
     online_field: str = DEFAULT_ONLINE_FIELD
@@ -108,7 +115,7 @@ class BatchStats:
     processed: int = 0
     skipped_missing: int = 0
     skipped_invalid: int = 0
-    opencell_failed: int = 0
+    lookup_failed: int = 0
     ready_for_upload: int = 0
     unique_cell_keys: int = 0
     cache_hits: int = 0
@@ -153,11 +160,9 @@ def load_config(config_path: Path) -> Config:
         raise AppError(f"Unable to read configuration file: {exc}") from exc
 
     required_keys = [
-        "OPENCELL_TOKEN",
         "DMP_USERNAME",
         "DMP_PASSWORD",
         "DMP_COMPANY_ID",
-        "OPENCELL_API_URL",
         "DMP_TOKEN_URL",
         "DMP_API_BASE_URL",
         "DMP_PLMN_FIELD",
@@ -175,6 +180,10 @@ def load_config(config_path: Path) -> Config:
         if not value:
             raise AppError(f"Missing or invalid configuration value: {key}")
         return value
+
+    location_provider = raw.get("LOCATION_PROVIDER", DEFAULT_LOCATION_PROVIDER).strip().lower() or DEFAULT_LOCATION_PROVIDER
+    if location_provider not in {"opencell", "here"}:
+        raise AppError("Configuration value 'LOCATION_PROVIDER' must be 'opencell' or 'here'.")
 
     timeout_value = parse_positive_int(
         raw.get("REQUEST_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS)),
@@ -220,13 +229,29 @@ def load_config(config_path: Path) -> Config:
         "DMP_LONG_OPERATION_TIMEOUT_SECONDS",
     )
 
+    opencell_token: str | None = None
+    opencell_api_url: str | None = None
+    here_api_key: str | None = None
+    here_api_url = raw.get("HERE_API_URL", DEFAULT_HERE_API_URL).strip() or DEFAULT_HERE_API_URL
+    here_fallback = raw.get("HERE_FALLBACK", DEFAULT_HERE_FALLBACK).strip() or DEFAULT_HERE_FALLBACK
+
+    if location_provider == "opencell":
+        opencell_token = read_text_key("OPENCELL_TOKEN")
+        opencell_api_url = read_text_key("OPENCELL_API_URL")
+    else:
+        here_api_key = read_text_key("HERE_API_KEY")
+
     return Config(
+        location_provider=location_provider,
         dmp_username=read_text_key("DMP_USERNAME"),
         dmp_password=read_text_key("DMP_PASSWORD"),
-        opencell_token=read_text_key("OPENCELL_TOKEN"),
+        opencell_token=opencell_token,
+        here_api_key=here_api_key,
         dmp_token_url=read_text_key("DMP_TOKEN_URL"),
         dmp_api_base_url=read_text_key("DMP_API_BASE_URL").rstrip("/"),
-        opencell_api_url=read_text_key("OPENCELL_API_URL"),
+        opencell_api_url=opencell_api_url,
+        here_api_url=here_api_url,
+        here_fallback=here_fallback,
         fields=FieldNames(
             plmn=read_text_key("DMP_PLMN_FIELD"),
             cell_id=read_text_key("DMP_CELL_FIELD"),
@@ -241,7 +266,7 @@ def load_config(config_path: Path) -> Config:
         run_interval_hours=run_interval_hours,
         batch_page_size=batch_page_size,
         mnc_length=mnc_length,
-        cache_path=Path(raw.get("OPENCELL_CACHE_PATH", str(DEFAULT_CACHE_PATH)).strip() or str(DEFAULT_CACHE_PATH)),
+        cache_path=Path(raw.get("LOCATION_CACHE_PATH", str(DEFAULT_CACHE_PATH)).strip() or str(DEFAULT_CACHE_PATH)),
         output_retention_days=output_retention_days,
         log_retention_days=log_retention_days,
         long_operation_path=raw.get("DMP_LONG_OPERATION_PATH", DEFAULT_LONG_OPERATION_PATH).strip() or DEFAULT_LONG_OPERATION_PATH,
@@ -617,17 +642,17 @@ def build_cell_cache_key(cellular_data: CellularData) -> str:
 
 def load_opencell_cache(cache_path: Path, logger: logging.Logger) -> dict[str, OpenCellResult]:
     if not cache_path.exists():
-        logger.info("OpenCell cache file does not exist yet. path=%s", cache_path)
+        logger.info("Location cache file does not exist yet. path=%s", cache_path)
         return {}
 
     try:
         raw_data = json.loads(cache_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        logger.warning("OpenCell cache could not be loaded. Starting with empty cache. path=%s", cache_path)
+        logger.warning("Location cache could not be loaded. Starting with empty cache. path=%s", cache_path)
         return {}
 
     if not isinstance(raw_data, dict):
-        logger.warning("OpenCell cache has invalid structure. Starting with empty cache. path=%s", cache_path)
+        logger.warning("Location cache has invalid structure. Starting with empty cache. path=%s", cache_path)
         return {}
 
     cache: dict[str, OpenCellResult] = {}
@@ -646,7 +671,7 @@ def load_opencell_cache(cache_path: Path, logger: logging.Logger) -> dict[str, O
             accuracy=accuracy_value,
         )
 
-    logger.info("Loaded OpenCell cache entries. path=%s entries=%s", cache_path, len(cache))
+    logger.info("Loaded location cache entries. path=%s entries=%s", cache_path, len(cache))
     return cache
 
 
@@ -666,10 +691,10 @@ def save_opencell_cache(
     try:
         cache_path.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
     except OSError as exc:
-        logger.warning("Failed to save OpenCell cache. path=%s error=%s", cache_path, exc)
+        logger.warning("Failed to save location cache. path=%s error=%s", cache_path, exc)
         return
 
-    logger.info("Saved OpenCell cache entries. path=%s entries=%s", cache_path, len(cache))
+    logger.info("Saved location cache entries. path=%s entries=%s", cache_path, len(cache))
 
 
 def query_opencell(
@@ -678,6 +703,9 @@ def query_opencell(
     cellular_data: CellularData,
     logger: logging.Logger,
 ) -> OpenCellResult:
+    if not config.opencell_token or not config.opencell_api_url:
+        raise AppError("OpenCell provider is selected but OPENCELL configuration is incomplete.")
+
     payload = {
         "token": config.opencell_token,
         "radio": "lte",
@@ -731,6 +759,87 @@ def query_opencell(
         longitude=float(longitude),
         accuracy=accuracy_value,
     )
+
+
+def query_here(
+    session: Session,
+    config: Config,
+    cellular_data: CellularData,
+    logger: logging.Logger,
+) -> OpenCellResult:
+    if not config.here_api_key:
+        raise AppError("HERE provider is selected but HERE_API_KEY is missing.")
+
+    payload = {
+        "lte": [
+            {
+                "mcc": int(cellular_data.mcc),
+                "mnc": int(cellular_data.mnc),
+                "cid": cellular_data.cell_id,
+            }
+        ]
+    }
+    params = {
+        "apiKey": config.here_api_key,
+        "fallback": config.here_fallback,
+    }
+
+    logger.info(
+        "Querying HERE Positioning API. url=%s api_key=%s fallback=%s mcc=%s mnc=%s cell_id=%s",
+        config.here_api_url,
+        mask_secret(config.here_api_key),
+        config.here_fallback,
+        cellular_data.mcc,
+        cellular_data.mnc,
+        cellular_data.cell_id,
+    )
+    response = perform_request(
+        session,
+        "POST",
+        config.here_api_url,
+        timeout=config.request_timeout_seconds,
+        logger=logger,
+        action="HERE lookup",
+        verify_tls=config.verify_tls,
+        params=params,
+        json=payload,
+    )
+    data = ensure_success_json(response, "HERE lookup")
+
+    location = data.get("location")
+    if not isinstance(location, dict):
+        raise AppError("HERE lookup returned no location object for the supplied cell data.")
+
+    latitude = location.get("lat")
+    longitude = location.get("lng")
+    if not isinstance(latitude, (int, float)) or not isinstance(longitude, (int, float)):
+        raise AppError("HERE lookup returned no coordinates for the supplied cell data.")
+
+    accuracy = location.get("accuracy")
+    accuracy_value = float(accuracy) if isinstance(accuracy, (int, float)) else None
+
+    logger.info(
+        "HERE lookup succeeded. lat=%s lon=%s accuracy=%s",
+        latitude,
+        longitude,
+        accuracy_value,
+    )
+    return OpenCellResult(
+        latitude=float(latitude),
+        longitude=float(longitude),
+        accuracy=accuracy_value,
+    )
+
+
+def query_location(
+    session: Session,
+    config: Config,
+    cellular_data: CellularData,
+    logger: logging.Logger,
+) -> OpenCellResult:
+    if config.location_provider == "here":
+        return query_here(session, config, cellular_data, logger)
+    return query_opencell(session, config, cellular_data, logger)
 
 def build_csv_payload(rows: list[CsvUpdateRow], config: Config) -> bytes:
     buffer = io.StringIO(newline="")
@@ -974,14 +1083,14 @@ def process_online_devices(
         if cached_location is not None:
             stats.cache_hits += 1
             location = cached_location
-            logger.info("Using cached OpenCell result. mac=%s cell_key=%s", mac_address, cell_key)
+            logger.info("Using cached location result. mac=%s cell_key=%s", mac_address, cell_key)
         else:
             stats.cache_misses += 1
             try:
-                location = query_opencell(session, config, cellular_data, logger)
+                location = query_location(session, config, cellular_data, logger)
             except AppError as exc:
-                stats.opencell_failed += 1
-                logger.warning("Skipping device due to OpenCell failure. mac=%s error=%s", mac_address, exc)
+                stats.lookup_failed += 1
+                logger.warning("Skipping device due to location lookup failure. mac=%s error=%s", mac_address, exc)
                 continue
             opencell_cache[cell_key] = location
 
@@ -1012,7 +1121,7 @@ def run_batch_mode(
         raise AppError("No online devices were returned by WADMP.")
 
     print_status(f"Loaded {len(devices)} online devices.")
-    print_status("Querying OpenCell API for online devices...")
+    print_status(f"Querying {config.location_provider.upper()} API for online devices...")
     csv_rows, stats = process_online_devices(session, config, devices, logger)
     if not csv_rows:
         raise AppError("No GPS updates were generated for online devices.")
@@ -1052,7 +1161,7 @@ def wait_for_next_run(run_interval_hours: int, logger: logging.Logger, reason: s
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Update WADMP GPS fields for all online routers using LTE cell data and OpenCell lookup."
+        description="Update WADMP GPS fields for all online routers using LTE cell data and a configurable location lookup provider."
     )
     parser.add_argument(
         "--config",
@@ -1095,7 +1204,7 @@ def run() -> int:
                             f"cache_hits={stats.cache_hits}, "
                             f"cache_misses={stats.cache_misses}, "
                             f"missing_or_invalid={stats.skipped_missing + stats.skipped_invalid}, "
-                            f"opencell_failed={stats.opencell_failed}."
+                            f"lookup_failed={stats.lookup_failed}."
                         )
 
                     if config.run_interval_hours == 0:

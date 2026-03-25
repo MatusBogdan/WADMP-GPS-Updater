@@ -2,7 +2,7 @@
 
 ## What This Application Does
 
-This console application is designed for bulk processing of WADMP routers. It reads LTE cell information for all online routers in a company, queries the OpenCell / Unwired Labs API for approximate coordinates, and writes the resulting latitude, longitude, and altitude back to WADMP through a CSV bulk update.
+This console application is designed for bulk processing of WADMP routers. It reads LTE cell information for all online routers in a company, queries a configurable location provider API for approximate coordinates, and writes the resulting latitude, longitude, and altitude back to WADMP through a CSV bulk update.
 
 The script validates input, handles common network and API failures, and writes technical diagnostics to `app.log`.
 
@@ -14,11 +14,17 @@ The script validates input, handles common network and API failures, and writes 
 |-- config.env.example
 |-- requirements.txt
 |-- README.md
-|-- output/
-|-- opencell_cache.json
 |-- deploy/
 |   |-- wadmp-gps-updater.service
 |   |-- wadmp-gps-updater.timer
+```
+
+Runtime-generated items created during execution:
+
+```text
+output/
+location_cache.json
+app.log
 ```
 
 ## Prerequisites
@@ -26,7 +32,7 @@ The script validates input, handles common network and API failures, and writes 
 - Windows or Linux with Python 3.11 or newer installed
 - Network access to the WADMP environment
 - A valid WADMP username and password
-- A valid OpenCell / Unwired Labs token
+- A valid location API credential for the selected provider
 - A valid WADMP company ID
 
 ## Installation
@@ -51,14 +57,26 @@ python3 -m pip install -r requirements.txt
 
 ### Required User-Editable Values
 
-- `OPENCELL_TOKEN`: OpenCell / Unwired Labs API token
+- `LOCATION_PROVIDER`: Supported values are `opencell` and `here`
 - `DMP_USERNAME`: WADMP login name
 - `DMP_PASSWORD`: WADMP login password
 - `DMP_COMPANY_ID`: Company ID used for bulk reading online devices and CSV upload
-- `OPENCELL_API_URL`: OpenCell API URL
 - `OUTPUT_RETENTION_DAYS`: Delete generated CSV files in `output` older than this number of days. Default: `14`
 - `LOG_RETENTION_DAYS`: Delete `app.log` if it is older than this number of days. Allowed range: `1` to `90`. Default: `14`
 - `RUN_INTERVAL_HOURS`: `0` runs the batch once. A positive integer repeats the batch every N hours until the process is stopped. Allowed range: `0` to `720`. Default: `0`
+
+### Provider-Specific Values
+
+If `LOCATION_PROVIDER="opencell"`:
+
+- `OPENCELL_TOKEN`: OpenCell / Unwired Labs API token
+- `OPENCELL_API_URL`: OpenCell API URL
+
+If `LOCATION_PROVIDER="here"`:
+
+- `HERE_API_KEY`: HERE Positioning API key
+- `HERE_API_URL`: HERE Positioning API locate endpoint. Default: `https://pos.ls.hereapi.com/positioning/v1/locate`
+- `HERE_FALLBACK`: HERE cell fallback mode. Default: `area`
 
 ### Usually Do Not Change
 
@@ -72,7 +90,7 @@ python3 -m pip install -r requirements.txt
 - `DMP_ONLINE_VALUE`: Value used to identify online devices. Default: `1`
 - `DMP_MNC_LENGTH`: Set to `2` or `3` if PLMN parsing requires explicit MNC length
 - `DMP_BATCH_PAGE_SIZE`: Number of devices per page in batch mode. Default: `100`
-- `OPENCELL_CACHE_PATH`: Path to the persistent OpenCell cache JSON file. Default: `opencell_cache.json`
+- `LOCATION_CACHE_PATH`: Path to the persistent location cache JSON file. Default: `location_cache.json`
 - `DMP_LONG_OPERATION_TIMEOUT_SECONDS`: Maximum wait time for long operation completion. Default: `120`
 
 ### Do Not Change Unless Explicitly Instructed
@@ -227,7 +245,8 @@ sudo systemctl status wadmp-gps-updater.service
 - `Authenticating to WADMP...`
 - `Reading online devices from WADMP...`
 - `Loaded N online devices.`
-- `Querying OpenCell API for online devices...`
+- `Querying OPENCELL API for online devices...`
+- `Querying HERE API for online devices...`
 - `Prepared N GPS updates. Uploading CSV to WADMP...`
 - `CSV accepted by WADMP. Waiting for long operation ID...`
 - `Batch update completed successfully.`
@@ -248,8 +267,8 @@ The log includes:
 - Startup
 - Authentication success or failure
 - Batch page loading summaries
-- OpenCell request summaries
-- OpenCell cache load/save summaries
+- Location provider request summaries
+- Location cache load/save summaries
 - Output cleanup summaries
 - Saved CSV file path
 - CSV upload summary
@@ -269,8 +288,8 @@ Sensitive values such as passwords and full bearer tokens are not written to the
 - If `DMP_MNC_LENGTH` is not set, a 5-digit PLMN is interpreted as `3+2` and a 6-digit PLMN as `3+3`.
 - GPS altitude is always written as numeric `0`.
 - Devices with missing or invalid `MoPlmn`, `MoCell`, or `MacAddress` are skipped.
-- OpenCell results are cached by `MCC + MNC + Cell ID`, so repeated BTS lookups are reused across devices and across runs.
-- The OpenCell lookup is best-effort because TAC is not available in WADMP.
+- Location results are cached by `MCC + MNC + Cell ID`, so repeated BTS lookups are reused across devices and across runs.
+- The lookup is best-effort because TAC is not available in WADMP.
 - If `RUN_INTERVAL_HOURS` is greater than `0`, a failed cycle is logged and the application continues with the next scheduled run instead of exiting immediately.
 
 ## Typical Errors and Troubleshooting
@@ -297,7 +316,7 @@ Possible causes:
 
 - Online devices are missing `MoPlmn` or `MoCell`
 - PLMN parsing failed
-- OpenCell returned no match for all devices
+- The selected location provider returned no match for all devices
 
 ### `WADMP CSV GPS update failed`
 
